@@ -190,7 +190,7 @@ class Trainer:
         if self.resume:
             ckpt = os.path.join(self.output_dir, "model.pt")
             if os.path.isfile(ckpt):
-                checkpoint = torch.load(ckpt)
+                checkpoint = torch.load(ckpt, map_location="cpu")
                 self.start_epoch = checkpoint['epoch'] + 1
                 # self.model.load_state_dict(checkpoint['state_dict'])
                 src_state = checkpoint['state_dict']
@@ -198,6 +198,8 @@ class Trainer:
                 for k in dst_state.keys():
                     if not k.startswith("module.") and "module."+k in src_state.keys():
                         k_ddp = "module."+k
+                    elif k.startswith("module.") and "module."+k not in src_state.keys():
+                        k_ddp = k.replace("module.", "", 1)
                     else:
                         k_ddp = k
                     if k_ddp in src_state.keys():
@@ -213,7 +215,7 @@ class Trainer:
                 
                 self.val_acc_list = checkpoint["acc"]
                 self.step_or_epoch = checkpoint["step_or_epoch"]
-                
+                model.to(self.device)
                 print(f"Checkpoint loaded successfully from '{ckpt}'")
             else:
                 print(f"No checkpoint found at '{ckpt}', does not resume status!")
@@ -237,6 +239,8 @@ class Trainer:
         Args:
             epoch (int): The current epoch number.
         """
+        if self.use_ddp or self.use_fsdp:
+            dist.barrier()
         logging.info(f"Train epoch: {epoch}, rank: {self.local_rank}\n")
         model.train()
 
@@ -246,8 +250,14 @@ class Trainer:
         optim.zero_grad()
         speed_stats = {}
         time5 = time.perf_counter()
-        
+        iterator_stop = torch.tensor(0).to(self.device)
+
+        dataloader_train.batch_sampler.set_epoch(epoch)
         for batch_idx, batch in enumerate(dataloader_train):
+            if self.use_ddp or self.use_fsdp:
+                dist.all_reduce(iterator_stop, dist.ReduceOp.SUM)
+                if iterator_stop > 0:
+                    break
             self.batch_total += 1
             time1 = time.perf_counter()
             speed_stats["data_load"] = f"{time1-time5:0.3f}"
@@ -330,7 +340,7 @@ class Trainer:
     
                 speed_stats["total_time"] = total_time
                 lr = scheduler.get_last_lr()[0]
-                batch_num_epoch = -1
+                batch_num_epoch = 1
                 if hasattr(dataloader_train, "__len__"):
                     batch_num_epoch = len(dataloader_train)
                 self.log(epoch, batch_idx,
@@ -354,9 +364,14 @@ class Trainer:
             if (batch_idx+1) % self.save_checkpoint_interval == 0:
                 self.save_checkpoint(epoch, model=model, optim=optim, scheduler=scheduler, scaler=scaler, step=batch_idx+1)
 
-        
+        else:
+            if self.use_ddp or self.use_fsdp:
+                iterator_stop.fill_(1)
+                dist.all_reduce(iterator_stop, dist.ReduceOp.SUM)
+                
         if self.use_ddp or self.use_fsdp:
             dist.barrier()
+            iterator_stop = torch.tensor(0).to(self.device)
         
         
 
@@ -374,6 +389,8 @@ class Trainer:
         Args:
             epoch (int): The current epoch number.
         """
+        if self.use_ddp or self.use_fsdp:
+            dist.barrier()
         logging.info(f"Validate epoch: {epoch}, rank: {self.local_rank}\n")
         model.eval()
         
@@ -381,7 +398,13 @@ class Trainer:
             
             speed_stats = {}
             time5 = time.perf_counter()
+            iterator_stop = torch.tensor(0).to(self.device)
+            dataloader_val.batch_sampler.set_epoch(epoch)
             for batch_idx, batch in enumerate(dataloader_val):
+                if self.use_ddp or self.use_fsdp:
+                    dist.all_reduce(iterator_stop, dist.ReduceOp.SUM)
+                    if iterator_stop > 0:
+                        break
                 time1 = time.perf_counter()
                 speed_stats["data_load"] = f"{time1 - time5:0.3f}"
                 batch = to_device(batch, self.device)
@@ -395,7 +418,7 @@ class Trainer:
                     # Apply weighted averaging for loss and stats
                     loss = (loss * weight.type(loss.dtype)).sum()
                     # if distributed, this method can also apply all_reduce()
-                    stats, weight = recursive_average(stats, weight, distributed=True)
+                    # stats, weight = recursive_average(stats, weight, distributed=True)
                     if self.use_ddp or self.use_fsdp:
                         dist.all_reduce(weight, op=dist.ReduceOp.SUM)
                     # Now weight is summation over all workers
@@ -417,8 +440,8 @@ class Trainer:
                     dist.all_reduce(val_acc_avg, op=dist.ReduceOp.SUM)
                     self.val_loss_avg = val_loss_avg.detach().cpu().item() / self.world_size
                     self.val_acc_avg = val_acc_avg.detach().cpu().item() / self.world_size
-                
-                batch_num_epoch = -1
+                time5 = time.perf_counter()
+                batch_num_epoch = 1
                 if hasattr(dataloader_val, "__len__"):
                     batch_num_epoch = len(dataloader_val)
                 self.log(epoch, batch_idx,
@@ -431,11 +454,17 @@ class Trainer:
                          tag="val",
                          )
 
+            else:
+                if self.use_ddp or self.use_fsdp:
+                    iterator_stop.fill_(1)
+                    dist.all_reduce(iterator_stop, dist.ReduceOp.SUM)
+                    
         self.val_acc_list.append(self.val_acc_avg)
         model.train()
-        
+
         if self.use_ddp or self.use_fsdp:
             dist.barrier()
+            iterator_stop = torch.tensor(0).to(self.device)
         
         
     def log(self,
